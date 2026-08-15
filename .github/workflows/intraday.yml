@@ -1,0 +1,63 @@
+name: Intraday alert (threshold watch)
+
+# Watches the US session and opens an Issue only when a threshold is breached.
+# cron is UTC. US session 09:30-16:00 ET = 13:30-20:00 (EDT) / 14:30-21:00 (EST).
+# Front-loaded: every 5 min 13:00-15:59 UTC (covers both opens' first hours),
+# every 15 min 16:00-21:45 UTC. Roughly 22:00-07:00 JST (overnight in Japan).
+# Note: GitHub-scheduled runs may be delayed or skipped under load.
+on:
+  schedule:
+    - cron: "*/5 13-15 * * 1-5"
+    - cron: "*/15 16-21 * * 1-5"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: intraday-alert
+  cancel-in-progress: false
+
+jobs:
+  alert:
+    runs-on: ubuntu-latest
+    env:
+      TZ: Asia/Tokyo
+      FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - id: check
+        name: Threshold check
+        run: |
+          ASOF=$(date +'%Y-%m-%d %H:%M %Z')
+          python market_risk.py --alert --asof "$ASOF" > alert.json
+          fired=$(python -c "import json;print(json.load(open('alert.json')).get('fired'))")
+          echo "fired=$fired" >> "$GITHUB_OUTPUT"
+          cat alert.json
+
+      - name: Open alert issue (dedup identical alerts)
+        if: steps.check.outputs.fired == 'True'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const a = JSON.parse(fs.readFileSync('alert.json', 'utf8'));
+            const title = `⚠️ Intraday alert: ${a.signature}`;
+            const { data: open } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner, repo: context.repo.repo,
+              state: 'open', per_page: 100,
+            });
+            if (open.some(i => i.title === title)) {
+              core.info('Same open alert already exists; skipping.');
+              return;
+            }
+            await github.rest.issues.create({
+              owner: context.repo.owner, repo: context.repo.repo,
+              title, body: a.body,
+            });

@@ -1,0 +1,79 @@
+name: Daily risk report
+
+# Runs on weekday mornings 08:00 JST (cron is UTC: 23:00 Sun-Thu = 08:00 Mon-Fri JST).
+# Generates the danger-score report + charts, commits the charts, and opens an Issue.
+on:
+  schedule:
+    - cron: "0 23 * * 0-4"
+  workflow_dispatch:
+
+permissions:
+  contents: write   # commit charts + score history
+  issues: write     # post the report as an issue
+
+concurrency:
+  group: daily-report
+  cancel-in-progress: false
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    env:
+      TZ: Asia/Tokyo
+      FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install chart deps
+        run: pip install --quiet matplotlib
+
+      - name: Build report, charts and history
+        run: |
+          ASOF=$(date +%Y-%m-%d)
+          echo "ASOF=$ASOF" >> "$GITHUB_ENV"
+          mkdir -p history "charts/$ASOF"
+
+          # Append today's composite score to the history CSV (for the trend chart).
+          SCORE=$(python market_risk.py --json | python -c "import json,sys; print(json.load(sys.stdin)['score'])")
+          [ -f history/scores.csv ] || echo "date,score" > history/scores.csv
+          # replace an existing row for today, then append
+          grep -v "^$ASOF," history/scores.csv > history/.tmp || true
+          mv history/.tmp history/scores.csv
+          echo "$ASOF,$SCORE" >> history/scores.csv
+
+          # Charts (best effort) then the Markdown report.
+          python market_risk.py --charts "charts/$ASOF" --history history/scores.csv || echo "charts step failed"
+          python market_risk.py --report md --asof "$ASOF" > report.md
+          cat report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Commit charts and history
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add history charts
+          git diff --cached --quiet || git commit -m "charts & score history ${ASOF}"
+          git push
+
+      - name: Open issue with report and charts
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const asof = process.env.ASOF;
+            let body = fs.readFileSync('report.md', 'utf8');
+            const dir = `charts/${asof}`;
+            const base = `https://raw.githubusercontent.com/${context.repo.owner}/${context.repo.repo}/main/${dir}`;
+            let imgs = [];
+            try { imgs = fs.readdirSync(dir).filter(f => f.endsWith('.png')); } catch (e) {}
+            if (imgs.length) {
+              body += `\n\n### Charts\n` + imgs.map(f => `![${f}](${base}/${f})`).join('\n');
+            }
+            await github.rest.issues.create({
+              owner: context.repo.owner, repo: context.repo.repo,
+              title: `[${asof}] US market danger report`,
+              body,
+            });
