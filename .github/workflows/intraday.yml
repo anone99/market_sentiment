@@ -60,4 +60,6 @@ jobs:
             await github.rest.issues.create({
               owner: context.repo.owner, repo: context.repo.repo,
               title, body: a.body,
+              // Assign the owner so GitHub sends a notification e-mail.
+              assignees: ['anone99'],
             });
