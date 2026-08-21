@@ -25,7 +25,7 @@ This defines how several indicators are combined into a single 0–100
 | Valuation | 15% | Shiller CAPE; forward/trailing PE deviation from long-run mean |
 | Trend | 20% | 200-day MA deviation; drawdown from 52-week high; below 200-day MA |
 | Volatility | 20% | VIX level; VIX term structure (VIX vs VIX3M); SKEW; VVIX |
-| Sentiment | 15% | Put/Call ratio (CBOE total); CNN Fear & Greed |
+| Sentiment | 15% | Put/Call ratio (index-scale, SPY chain); CNN Fear & Greed |
 | Credit/Macro | 20% | Yield curve (10Y-2Y, 10Y-3M); HY & IG OAS; NFCI; Sahm rule |
 | Breadth | 10% | Equal-weight ÷ cap-weight ratio (RSP/SPY); % of stocks above 200d MA |
 
@@ -78,11 +78,39 @@ VIX level: <13 → 10; 13–17 → 20; 17–20 → 35; 20–25 → 50; 25–30 �
 **+5** if SKEW ≥ 150, **+5** if VVIX ≥ 110 (capped at 100).
 
 ### Sentiment (mean of the parts)
-- Put/Call: <0.7 → 60; 0.7–0.9 → 25; 0.9–1.1 → 15; 1.1–1.3 → 40; >1.3 → 70.
+- **Put/Call, Cboe all-market total** (manual entry only, see below):
+  <0.7 → 60; 0.7–0.9 → 25; 0.9–1.1 → 15; 1.1–1.3 → 40; >1.3 → 70.
+- **Put/Call, index/ETF scale** (used by the automated run): <0.71 → 60;
+  0.71–1.09 → 25; 1.09–1.47 → 15; 1.47–1.84 → 40; >1.84 → 70.
 - Fear & Greed: >80 → 70; 60–80 → 45; 40–60 → 20; 20–40 → 45; <20 → 65.
 
 Extreme greed (complacency at tops) and extreme fear (already selling off) both
 raise danger.
+
+**Why two put/call scales.** Cboe's own put/call archives
+(`totalpc.csv` / `equitypc.csv` / `indexpc.csv`) stopped updating on
+**2019-10-04**, and no free source publishes the current all-market total. The
+automated run therefore computes the ratio from SPY's nearest-expiry option
+chain. Index/ETF options are structurally more put-heavy than the all-market
+total (hedging demand), so applying the total-scale thresholds to them would
+systematically overstate danger — SPY at 1.38 would score 70 ("fear") when it
+is in fact near its own median.
+
+The index-scale cut-points above are the **percentile-matched equivalents** of
+the total-scale ones, derived from Cboe's two archives over the 3,253 sessions
+they share (2006-11-01 … 2019-10-04):
+
+| Total cut | Percentile in `totalpc` | Same percentile in `indexpc` |
+|-----------|-------------------------|------------------------------|
+| 0.70 | 2.3rd | 0.71 |
+| 0.90 | 39.2nd | 1.09 |
+| 1.10 | 83.4th | 1.47 |
+| 1.30 | 97.0th | 1.84 |
+
+For reference, medians over that window were 0.93 (total) vs 1.16 (index).
+Because the mapping is calibrated on pre-2019 data, it does not account for the
+later growth of 0DTE volume — treat the index-scale ratio as the coarser of the
+two signals.
 
 ### Credit/Macro (max of the following)
 - **10Y-2Y** and **10Y-3M** spreads: >0.5 → 10; 0..0.5 → 30; −0.3..0 → 60;
@@ -114,5 +142,13 @@ raise danger.
 ## Data sources
 
 FRED (rates, HY/IG OAS, NFCI, Sahm, VIX), Yahoo Finance (prices, VIX3M, SKEW,
-VVIX, RSP, SPY), multpl (Shiller CAPE + monthly history), CNN (Fear & Greed;
-best effort — may be unreachable from CI runners).
+VVIX, RSP, SPY, SPY option chain for put/call), multpl (Shiller CAPE + monthly
+history), CNN (Fear & Greed).
+
+Two source quirks the fetchers work around:
+
+- CNN's dataviz host moved from `production.dataviz.cnn.com` (now NXDOMAIN) to
+  `production.dataviz.cnn.io`.
+- multpl, CNN and Yahoo's options endpoint all reject non-browser clients, so
+  requests carry a browser `User-Agent`/`Accept-Language`; the Yahoo options
+  endpoint additionally needs a session cookie plus a crumb token.

@@ -26,9 +26,9 @@ jobs:
       TZ: Asia/Tokyo
       FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 
@@ -43,7 +43,7 @@ jobs:
 
       - name: Open alert issue (dedup identical alerts)
         if: steps.check.outputs.fired == 'True'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const fs = require('fs');

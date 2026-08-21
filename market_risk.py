@@ -34,10 +34,21 @@ import json
 import os
 import re
 import sys
+import http.cookiejar
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, asdict
+from html import unescape
 
-UA = "Mozilla/5.0 (market-risk-monitor)"
+# CBOE's CDN and CNN's dataviz host both reject non-browser clients, so send a
+# realistic browser header set rather than a bespoke agent string.
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+BROWSER_HEADERS = {
+    "User-Agent": UA,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
 TIMEOUT = 25
 FRED_API_KEY = os.environ.get("FRED_API_KEY", "").strip()
 
@@ -49,8 +60,8 @@ VIX_LONG_RUN_AVG = 19.5
 # ---------------------------------------------------------------------------
 # Low-level fetch helpers
 # ---------------------------------------------------------------------------
-def _get(url: str) -> bytes:
-    req = urllib.request.Request(url, headers={"User-Agent": UA})
+def _get(url: str, headers: dict | None = None) -> bytes:
+    req = urllib.request.Request(url, headers={**BROWSER_HEADERS, **(headers or {})})
     with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
         return r.read()
 
@@ -128,10 +139,16 @@ def fetch_cape() -> float | None:
 def fetch_cape_history(max_points: int = 240) -> list[tuple[str, float]]:
     """Monthly Shiller CAPE history from multpl (best effort). Newest last."""
     try:
-        html = _get("https://www.multpl.com/shiller-pe/table/by-month").decode("utf-8", "ignore")
-        text = re.sub(r"<[^>]+>", "\n", html)
-        rows = re.findall(r"([A-Z][a-z]{2,8}\s+\d{1,2},\s*\d{4})\s+([0-9]+\.[0-9]+)", text)
-        pts = [(d, float(v)) for d, v in rows]
+        page = _get("https://www.multpl.com/shiller-pe/table/by-month").decode("utf-8", "ignore")
+        # Rows look like: <td>Aug 20, 2026</td><td> &#x2002; 41.79 </td> -- the
+        # EN-SPACE entity sits between date and value, so parse the cells
+        # rather than matching across the gap.
+        rows = re.findall(r"<td>([^<]+)</td>\s*<td>(.*?)</td>", page, re.S)
+        pts = []
+        for d, v in rows:
+            m = re.search(r"-?[0-9]+\.[0-9]+", unescape(v))
+            if m:
+                pts.append((unescape(d).strip(), float(m.group(0))))
         pts.reverse()  # page is newest-first -> make oldest-first
         return pts[-max_points:]
     except Exception as e:  # noqa: BLE001
@@ -141,7 +158,8 @@ def fetch_cape_history(max_points: int = 240) -> list[tuple[str, float]]:
 
 def fetch_cnn_fng() -> dict | None:
     try:
-        d = json.loads(_get("https://production.dataviz.cnn.com/index/fearandgreed/graphdata"))
+        # cnn.com's dataviz host no longer resolves; the live one is cnn.io.
+        d = json.loads(_get("https://production.dataviz.cnn.io/index/fearandgreed/graphdata"))
         out = {"score": float(d["fear_and_greed"]["score"]),
                "rating": d["fear_and_greed"]["rating"]}
         for k, v in d.items():
@@ -150,6 +168,46 @@ def fetch_cnn_fng() -> dict | None:
         return out
     except Exception as e:  # noqa: BLE001
         print(f"[warn] CNN F&G: {e}", file=sys.stderr)
+    return None
+
+
+def fetch_spy_put_call() -> float | None:
+    """Put/call *volume* ratio for SPY's front-month option chain (Yahoo).
+
+    Cboe's own total put/call archive stopped updating on 2019-10-04, so the
+    live ratio is computed from SPY's nearest-expiry chain instead. Yahoo's
+    options endpoint needs a session cookie plus a crumb token. Note this is
+    an index/ETF ratio, which is structurally more put-heavy than Cboe's
+    all-market total -- score it with PUT_CALL_INDEX_TABLE, not the total-scale
+    thresholds.
+    """
+    try:
+        opener = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+
+        def _open(url):
+            return opener.open(urllib.request.Request(url, headers=BROWSER_HEADERS),
+                               timeout=TIMEOUT).read()
+
+        try:
+            _open("https://fc.yahoo.com")   # sets the session cookie
+        except Exception:
+            pass                            # this endpoint 404s but still sets it
+        crumb = _open("https://query1.finance.yahoo.com/v1/test/getcrumb").decode().strip()
+        if not crumb:
+            print("[warn] SPY put/call: empty crumb", file=sys.stderr)
+            return None
+        d = json.loads(_open("https://query2.finance.yahoo.com/v7/finance/options/SPY"
+                             f"?crumb={urllib.parse.quote(crumb)}"))
+        chain = d["optionChain"]["result"][0]["options"][0]
+        calls = sum(c.get("volume") or 0 for c in chain["calls"])
+        puts = sum(p.get("volume") or 0 for p in chain["puts"])
+        if calls <= 0:
+            print("[warn] SPY put/call: zero call volume", file=sys.stderr)
+            return None
+        return round(puts / calls, 3)
+    except Exception as e:  # noqa: BLE001
+        print(f"[warn] SPY put/call: {e}", file=sys.stderr)
     return None
 
 
@@ -227,19 +285,30 @@ def score_volatility(vix, vix3m, skew=None, vvix=None):
     return float(min(100, base))
 
 
-def score_sentiment(put_call, fng):
+# Cboe all-market total put/call thresholds (docs/scoring.md).
+PUT_CALL_TOTAL_TABLE = [(0.7, 60), (0.9, 25), (1.1, 15), (1.3, 40)]
+# Index/ETF option chains are structurally more put-heavy, so the same danger
+# levels sit at higher ratios. These cut-points are the percentile-matched
+# equivalents of the total-scale ones, derived from Cboe's own totalpc.csv vs
+# indexpc.csv archives (3,253 shared sessions, 2006-11-01..2019-10-04):
+#   total 0.7 = 2.3rd pct -> index 0.71    total 1.1 = 83.4th pct -> index 1.47
+#   total 0.9 = 39.2nd pct -> index 1.09   total 1.3 = 97.0th pct -> index 1.84
+PUT_CALL_INDEX_TABLE = [(0.71, 60), (1.09, 25), (1.47, 15), (1.84, 40)]
+
+
+def _put_call_danger(ratio, table):
+    for cut, danger in table:
+        if ratio < cut:
+            return danger
+    return 70
+
+
+def score_sentiment(put_call, fng, put_call_index=None):
     parts = []
     if put_call is not None:
-        if put_call < 0.7:
-            parts.append(60)
-        elif put_call < 0.9:
-            parts.append(25)
-        elif put_call < 1.1:
-            parts.append(15)
-        elif put_call < 1.3:
-            parts.append(40)
-        else:
-            parts.append(70)
+        parts.append(_put_call_danger(put_call, PUT_CALL_TOTAL_TABLE))
+    elif put_call_index is not None:
+        parts.append(_put_call_danger(put_call_index, PUT_CALL_INDEX_TABLE))
     if fng is not None:
         if fng > 80:
             parts.append(70)
@@ -318,7 +387,8 @@ class Inputs:
     vix3m: float | None = None
     skew: float | None = None
     vvix: float | None = None
-    put_call: float | None = None
+    put_call: float | None = None        # Cboe all-market total ratio (manual)
+    put_call_index: float | None = None  # SPY front-month chain ratio (auto)
     fng: float | None = None
     t10y2y: float | None = None
     t10y3m: float | None = None
@@ -335,7 +405,8 @@ def _available(inp: Inputs) -> dict[str, bool]:
         "valuation": inp.cape is not None or inp.pe_dev_pct is not None or inp.ecy is not None,
         "trend": inp.dev200 is not None or inp.drawdown_pct is not None,
         "volatility": inp.vix is not None,
-        "sentiment": inp.put_call is not None or inp.fng is not None,
+        "sentiment": any(x is not None for x in
+                         (inp.put_call, inp.put_call_index, inp.fng)),
         "credit": any(x is not None for x in
                       (inp.t10y2y, inp.t10y3m, inp.hy_oas, inp.ig_oas, inp.nfci, inp.sahm)),
         "breadth": inp.pct_above_200ma is not None or inp.ew_cw_dev is not None,
@@ -359,7 +430,7 @@ def compute(inp: Inputs) -> dict:
         "valuation": score_valuation(inp.cape, inp.pe_dev_pct, inp.ecy),
         "trend": score_trend(inp.dev200, inp.drawdown_pct, inp.below_ma200),
         "volatility": score_volatility(inp.vix, inp.vix3m, inp.skew, inp.vvix),
-        "sentiment": score_sentiment(inp.put_call, inp.fng),
+        "sentiment": score_sentiment(inp.put_call, inp.fng, inp.put_call_index),
         "credit": score_credit(inp.t10y2y, inp.t10y3m, inp.hy_oas,
                                inp.ig_oas, inp.nfci, inp.sahm),
         "breadth": score_breadth(inp.pct_above_200ma, inp.ew_cw_dev),
@@ -409,6 +480,7 @@ def collect_auto() -> tuple[Inputs, dict]:
     # Excess CAPE Yield (Shiller): earnings yield minus the real 10y yield.
     if inp.cape and inp.real10y is not None:
         inp.ecy = round(100.0 / inp.cape - inp.real10y, 2)
+    inp.put_call_index = fetch_spy_put_call()
     fng = fetch_cnn_fng()
     if fng:
         inp.fng = fng["score"]  # CNN put_call_options is a 0-100 index, not a ratio
@@ -498,7 +570,8 @@ def render_markdown(result: dict, dates: dict, asof: str, charts: list[str] | No
         ("Drawdown from 52w high %", inp["drawdown_pct"], None),
         ("VIX", inp["vix"], None), ("VIX3M", inp["vix3m"], None),
         ("SKEW", inp["skew"], None), ("VVIX", inp["vvix"], None),
-        ("Put/Call", inp["put_call"], None),
+        ("Put/Call (Cboe total)", inp["put_call"], None),
+        ("Put/Call (SPY front-month)", inp["put_call_index"], None),
         ("Fear & Greed", inp["fng"], None),
         ("10Y-2Y", inp["t10y2y"], dates.get("t10y2y")),
         ("10Y-3M", inp["t10y3m"], dates.get("t10y3m")),

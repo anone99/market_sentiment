@@ -17,7 +17,7 @@ intraday for threshold breaches.
 | Valuation | 15% | **Excess CAPE Yield (ECY)** = 1/CAPE − real 10y (primary); Shiller CAPE; PE vs mean | Low (poor timing tool) |
 | Trend | 20% | 200-day MA deviation, drawdown from 52w high, below-200MA | Medium |
 | Volatility | 20% | VIX level, VIX term structure (VIX vs VIX3M), SKEW, VVIX | High |
-| Sentiment | 15% | Put/Call ratio (CBOE total), CNN Fear & Greed | Medium (contrarian) |
+| Sentiment | 15% | Put/Call ratio (SPY chain, index-scale calibrated), CNN Fear & Greed | Medium (contrarian) |
 | Credit/Macro | 20% | Yield curve (10Y-2Y, 10Y-3M), HY & IG OAS, NFCI, Sahm rule | High |
 | Breadth | 10% | Equal-weight ÷ cap-weight ratio (RSP/SPY), % above 200d MA | Medium–High |
 
@@ -88,9 +88,14 @@ python market_risk.py --manual         # enter values by hand
 ```
 
 Data sources (all free): FRED (rates/credit/NFCI/Sahm), Yahoo Finance
-(prices/VIX/SKEW/VVIX/RSP/SPY), multpl (Shiller CAPE), CNN (Fear & Greed,
-best effort). Some are blocked from certain sandboxes; run on Actions or a host
-that can reach them.
+(prices/VIX/SKEW/VVIX/RSP/SPY + SPY option chain for put/call), multpl (Shiller
+CAPE), CNN (Fear & Greed). Some are blocked from certain sandboxes; run on
+Actions or a host that can reach them.
+
+Note on put/call: Cboe's public put/call archives stopped updating on
+2019-10-04, so the live ratio comes from SPY's nearest-expiry chain and is
+scored against index-scale thresholds calibrated from Cboe's own archives —
+see [`docs/scoring.md`](docs/scoring.md#sentiment-mean-of-the-parts).
 
 ## Layout
 
