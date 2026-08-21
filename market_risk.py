@@ -648,7 +648,10 @@ def generate_charts(out_dir: str, history_csv: str | None = None) -> list[str]:
         written.append(name)
 
     def _dates(ts):
-        return [_dt.datetime.utcfromtimestamp(t) for t in ts]
+        # utcfromtimestamp() is deprecated; convert explicitly and drop the
+        # tzinfo so these stay naive-UTC like the CAPE chart's strptime dates.
+        return [_dt.datetime.fromtimestamp(t, _dt.timezone.utc).replace(tzinfo=None)
+                for t in ts]
 
     # 1) S&P 500 with 50/200-day moving averages
     ts, sp = fetch_yahoo_series("%5EGSPC", "1y")
